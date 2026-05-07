@@ -1,0 +1,7 @@
+subset_name,subset_size,target,target_label,best_model,best_family,best_rmse,best_mape,pilstm_rank_by_rmse
+low_data_100,100,cold_outlet_temperature_k,Cold outlet temperature,LinearRegressionGD,Traditional ML,1.853864183953889,0.5035189667272283,
+low_data_100,100,hot_outlet_temperature_k,Hot outlet temperature,LinearRegressionGD,Traditional ML,0.321493474217376,0.06639534648280054,8.0
+low_data_100,100,hx_1_heat_load_kw,Heat load,LinearRegressionGD,Traditional ML,1.4210791547703914,1.1915728174144082,
+low_data_125,125,cold_outlet_temperature_k,Cold outlet temperature,LinearRegressionGD,Traditional ML,1.4981932441044197,0.36485692361945504,
+low_data_125,125,hot_outlet_temperature_k,Hot outlet temperature,LinearRegressionGD,Traditional ML,0.24005808608229467,0.047813567123106686,8.0
+low_data_125,125,hx_1_heat_load_kw,Heat load,LinearRegressionGD,Traditional ML,1.0572477078030929,0.8535754038894904,

@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files (large binary files - don't push to GitHub)
+*.h5
+*.keras
+*.joblib
+*.pb
+*.ckpt
+*.weights.h5
+
+# Generated plots and outputs (don't push to GitHub)
+training_history.png
+predictions_vs_actual.png
+detailed_comparison.png
+time_series_comparison.png
+model_architecture.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Logs
+logs/
+*.log
+
+# TensorFlow
+.tensorboard/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Comparison outputs (generated files - don't push)
+predictions_comparison.csv
+detailed_comparison.csv
+
+# Temporary files
+temp/
+add_pilstm_to_notebook.py

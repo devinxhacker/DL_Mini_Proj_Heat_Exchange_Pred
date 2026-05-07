@@ -1,0 +1,290 @@
+"""
+Physics-Informed LSTM Model for Heat Exchanger Temperature Prediction
+"""
+
+import os
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+# reduce verbose TensorFlow logs (must be set before importing TF)
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    # quiet retracing/info logs
+    try:
+        tf.get_logger().setLevel('ERROR')
+    except Exception:
+        pass
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+
+
+def physics_loss(y_true, y_pred):
+    """Custom physics-informed loss function"""
+    mse_loss = tf.reduce_mean(tf.square(y_true - y_pred))
+    hot_outlet_pred = y_pred[:, 0]
+    cold_outlet_pred = y_pred[:, 1]
+    physics_penalty = tf.reduce_mean(
+        tf.maximum(0.0, -hot_outlet_pred) +
+        tf.maximum(0.0, -cold_outlet_pred)
+    )
+    total_loss = mse_loss + 0.1 * physics_penalty
+    return total_loss
+
+
+class PhysicsInformedLSTM:
+    def __init__(
+        self,
+        sequence_length=10,
+        lstm_units=64,
+        learning_rate=0.001,
+        physics_weight: float = 1.0,
+        cp_hot_kj_kgk: float = 4.18,
+        cp_cold_kj_kgk: float = 4.18,
+        cold_inlet_temperature_k: float = 293.15,
+        use_hard_energy_balance: bool = False,
+    ):
+        self.sequence_length = sequence_length
+        self.lstm_units = lstm_units
+        self.learning_rate = learning_rate
+        self.physics_weight = float(physics_weight)
+        self.cp_hot = float(cp_hot_kj_kgk)
+        self.cp_cold = float(cp_cold_kj_kgk)
+        self.cold_inlet_temperature_k = float(cold_inlet_temperature_k)
+        self.use_hard_energy_balance = bool(use_hard_energy_balance)
+        self.model = None
+        self.scaler_X = StandardScaler()
+        self.scaler_y = StandardScaler()
+        self.history = None
+        
+    def create_sequences(self, X, y):
+        X_seq, y_seq = [], []
+        for i in range(len(X) - self.sequence_length):
+            X_seq.append(X[i:i + self.sequence_length])
+            y_seq.append(y[i + self.sequence_length])
+        return np.array(X_seq), np.array(y_seq)
+    
+    def build_model(self, input_shape):
+        inputs = layers.Input(shape=input_shape)
+        x = layers.LSTM(self.lstm_units, return_sequences=True)(inputs)
+        x = layers.Dropout(0.2)(x)
+        x = layers.LSTM(self.lstm_units // 2, return_sequences=True)(x)
+        x = layers.Dropout(0.2)(x)
+        x = layers.LSTM(self.lstm_units // 4, return_sequences=False)(x)
+        x = layers.Dropout(0.2)(x)
+        x = layers.Dense(32, activation='relu')(x)
+        x = layers.Dense(16, activation='relu')(x)
+        # if using hard energy-balance, predict only hot outlet and compute cold outlet from energy balance
+        out_dims = 1 if self.use_hard_energy_balance else 2
+        outputs = layers.Dense(out_dims, activation='linear')(x)
+        model = keras.Model(inputs=inputs, outputs=outputs)
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+        # compile with a placeholder loss (we use custom training loop when training)
+        model.compile(optimizer=optimizer, loss='mse', metrics=['mae', 'mse'])
+        self.model = model
+        return model
+    
+    def prepare_data(self, df_in):
+        input_features = [
+            'hot_inlet_temperature_k',
+            'cold_inlet_mass_flow_kg_s',
+            'hx_1_heat_load_kw',
+            'hot_outlet_pressure_pa',
+            'cold_outlet_pressure_pa',
+            'hot_outlet_mass_flow_kg_s',
+            'cold_outlet_mass_flow_kg_s',
+            'hx_1_logarithmic_mean_temperature_difference_lmtd_k'
+        ]
+        output_features = [
+            'hot_outlet_temperature_k',
+            'cold_outlet_temperature_k'
+        ]
+        X = df_in[input_features].values
+        y = df_in[output_features].values
+        return X, y
+    
+    def train(self, X_train, y_train, X_val, y_val, epochs=1000, batch_size=32, verbose=1):
+        # Prepare scaled and raw copies so we can compute physics loss on physical units
+        X_train_orig = np.asarray(X_train, dtype=float)
+        X_val_orig = np.asarray(X_val, dtype=float)
+
+        X_train_scaled = self.scaler_X.fit_transform(X_train_orig.reshape(-1, X_train_orig.shape[-1]))
+        X_train_scaled = X_train_scaled.reshape(X_train_orig.shape)
+        X_val_scaled = self.scaler_X.transform(X_val_orig.reshape(-1, X_val_orig.shape[-1]))
+        X_val_scaled = X_val_scaled.reshape(X_val_orig.shape)
+
+        y_train_orig = np.asarray(y_train, dtype=float)
+        y_val_orig = np.asarray(y_val, dtype=float)
+        y_train_scaled = self.scaler_y.fit_transform(y_train_orig)
+        y_val_scaled = self.scaler_y.transform(y_val_orig)
+
+        # Create datasets that yield both scaled inputs (for the model) and original inputs (for physics)
+        # Use drop_remainder so batch shapes are consistent (avoids retracing/OutOfRange warnings)
+        train_ds = tf.data.Dataset.from_tensor_slices(
+            (X_train_scaled, X_train_orig, y_train_scaled, y_train_orig)
+        ).shuffle(1024).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+
+        val_ds = tf.data.Dataset.from_tensor_slices(
+            (X_val_scaled, X_val_orig, y_val_scaled, y_val_orig)
+        ).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+
+        train_history = {"loss": [], "val_loss": []}
+
+        best_val = np.inf
+        patience = 15
+        wait = 0
+
+        # Indices in the input feature vector per prepare_data()
+        # 0: hot_inlet_temperature_k
+        # 1: cold_inlet_mass_flow_kg_s
+        # 5: hot_outlet_mass_flow_kg_s or assumed hot flow
+        hot_inlet_idx = 0
+        cold_flow_idx = 1
+        hot_flow_idx = 5
+
+        for epoch in range(epochs):
+            # Training
+            epoch_losses = []
+            for X_scaled_batch, X_orig_batch, y_scaled_batch, y_orig_batch in train_ds:
+                with tf.GradientTape() as tape:
+                    preds_scaled = self.model(X_scaled_batch, training=True)
+
+                    # Build predicted physical outputs depending on mode
+                    y_true_phys = tf.cast(y_orig_batch, tf.float32)
+                    if self.use_hard_energy_balance:
+                        # preds_scaled: (batch,1) => hot outlet only
+                        hot_scale = float(self.scaler_y.scale_[0])
+                        hot_mean = float(self.scaler_y.mean_[0])
+                        hot_pred_phys = tf.reshape(preds_scaled[:, 0] * hot_scale + hot_mean, [-1])
+
+                        # Use last-timestep inputs to compute cold outlet from energy balance
+                        hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                        cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                        hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+
+                        Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
+                        cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + float(
+                            self.cold_inlet_temperature_k
+                        )
+                        preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
+                    else:
+                        # Unscale predictions to physical units: y = y_scaled * scale + mean
+                        y_scale = tf.constant(self.scaler_y.scale_, dtype=tf.float32)
+                        y_mean = tf.constant(self.scaler_y.mean_, dtype=tf.float32)
+                        preds_phys = preds_scaled * y_scale + y_mean
+
+                    # Compute MSE in physical units
+                    mse_loss = tf.reduce_mean(tf.square(y_true_phys - preds_phys))
+
+                    # Compute energy balance gap per sample (compare Q_hot and Q_cold)
+                    hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                    cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                    hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+                    heat_load = tf.cast(X_orig_batch[:, -1, 2], tf.float32)
+
+                    hot_outlet_pred = preds_phys[:, 0]
+                    cold_outlet_pred = preds_phys[:, 1]
+
+                    Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_outlet_pred)
+                    Q_cold = cold_flow * float(self.cp_cold) * (
+                        cold_outlet_pred - float(self.cold_inlet_temperature_k)
+                    )
+
+                    # normalize energy gap by heat load magnitude to keep units comparable to temperature MSE
+                    denom = tf.abs(heat_load) + 1e-6
+                    rel_gap = tf.abs(Q_hot - Q_cold) / denom
+                    physics_penalty = tf.reduce_mean(rel_gap)
+
+                    total_loss = mse_loss + float(self.physics_weight) * physics_penalty
+
+                grads = tape.gradient(total_loss, self.model.trainable_variables)
+                optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+                epoch_losses.append(float(total_loss.numpy()))
+
+            # Validation
+            val_losses = []
+            for X_scaled_batch, X_orig_batch, y_scaled_batch, y_orig_batch in val_ds:
+                preds_scaled = self.model(X_scaled_batch, training=False)
+                y_true_phys = tf.cast(y_orig_batch, tf.float32)
+                if self.use_hard_energy_balance:
+                    hot_scale = float(self.scaler_y.scale_[0])
+                    hot_mean = float(self.scaler_y.mean_[0])
+                    hot_pred_phys = tf.reshape(preds_scaled[:, 0] * hot_scale + hot_mean, [-1])
+                    hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                    cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                    hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+                    Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
+                    cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + float(
+                        self.cold_inlet_temperature_k
+                    )
+                    preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
+                else:
+                    y_scale = tf.constant(self.scaler_y.scale_, dtype=tf.float32)
+                    y_mean = tf.constant(self.scaler_y.mean_, dtype=tf.float32)
+                    preds_phys = preds_scaled * y_scale + y_mean
+
+                mse_loss = tf.reduce_mean(tf.square(y_true_phys - preds_phys))
+                hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+                heat_load = tf.cast(X_orig_batch[:, -1, 2], tf.float32)
+                hot_outlet_pred = preds_phys[:, 0]
+                cold_outlet_pred = preds_phys[:, 1]
+                Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_outlet_pred)
+                Q_cold = cold_flow * float(self.cp_cold) * (
+                    cold_outlet_pred - float(self.cold_inlet_temperature_k)
+                )
+                denom = tf.abs(heat_load) + 1e-6
+                rel_gap = tf.abs(Q_hot - Q_cold) / denom
+                physics_penalty = tf.reduce_mean(rel_gap)
+                val_loss = mse_loss + float(self.physics_weight) * physics_penalty
+                val_losses.append(float(val_loss.numpy()))
+
+            avg_train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            avg_val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+            train_history["loss"].append(avg_train_loss)
+            train_history["val_loss"].append(avg_val_loss)
+
+            if verbose:
+                print(f"Epoch {epoch+1}/{epochs} - loss={avg_train_loss:.4f} - val_loss={avg_val_loss:.4f}")
+
+            # Early stopping
+            if avg_val_loss < best_val - 1e-6:
+                best_val = avg_val_loss
+                wait = 0
+                # Save best weights
+                best_weights = self.model.get_weights()
+            else:
+                wait += 1
+                if wait >= patience:
+                    if verbose:
+                        print("Early stopping: restoring best weights")
+                    self.model.set_weights(best_weights)
+                    break
+
+        # Store history in same shape as Keras
+        class H:
+            history = train_history
+
+        self.history = H.history
+        return self.history
+    
+    def predict(self, X):
+        X_scaled = self.scaler_X.transform(X.reshape(-1, X.shape[-1]))
+        X_scaled = X_scaled.reshape(X.shape)
+        # Use direct forward pass instead of model.predict to avoid tf.function retracing noise
+        y_pred_scaled = self.model(X_scaled, training=False).numpy()
+        if self.use_hard_energy_balance or y_pred_scaled.shape[1] == 1:
+            # Hard-balance mode predicts hot outlet only; callers derive cold outlet separately.
+            hot_scale = float(self.scaler_y.scale_[0])
+            hot_mean = float(self.scaler_y.mean_[0])
+            hot_pred = (y_pred_scaled[:, 0] * hot_scale) + hot_mean
+            return hot_pred.reshape(-1, 1)
+
+        y_pred = self.scaler_y.inverse_transform(y_pred_scaled)
+        return y_pred

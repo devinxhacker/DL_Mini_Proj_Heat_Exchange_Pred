@@ -36,6 +36,10 @@ from version_2.plain_deep_models import (
     save_deep_artifact,
     scale_sequence_dataset,
 )
+from version_2.synthetic_pilstm_data import (
+    create_grouped_sequence_dataset,
+    ensure_synthetic_pilstm_dataset,
+)
 from version_2.scratch_experiment import build_version1_feature_frame, run_experiment
 from version_2.study_utils import (
     DATA_DIR,
@@ -63,7 +67,10 @@ PILSTM_EPOCHS = 1000
 PILSTM_BATCH_SIZE = 32
 PILSTM_TEST_FRACTION = 0.15
 PILSTM_VAL_FRACTION_OF_REMAINING = 0.176
-PILSTM_PHYSICS_WEIGHT = 100.0
+PILSTM_PHYSICS_WEIGHT = 10.0
+PILSTM_SYNTHETIC_PRETRAIN_EPOCHS = 150
+PILSTM_SYNTHETIC_PRETRAIN_BATCH_SIZE = 64
+PILSTM_SYNTHETIC_PRETRAIN_PATH = DATA_DIR / "synthetic_training_data.csv"
 
 MODEL_FAMILY = {
     "MeanBaseline": "Reference baseline",
@@ -268,6 +275,52 @@ def split_sequence_data(
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
+_PRETRAINED_PILSTM_WEIGHTS_PATH: Path | None = None
+
+
+def ensure_pretrained_pilstm_weights(results_dir: Path) -> Path | None:
+    global _PRETRAINED_PILSTM_WEIGHTS_PATH
+    if _PRETRAINED_PILSTM_WEIGHTS_PATH is not None and _PRETRAINED_PILSTM_WEIGHTS_PATH.exists():
+        return _PRETRAINED_PILSTM_WEIGHTS_PATH
+    if not TENSORFLOW_AVAILABLE:
+        return None
+
+    synthetic_path = ensure_synthetic_pilstm_dataset(PILSTM_SYNTHETIC_PRETRAIN_PATH, force=True)
+    synthetic_df = clean_numeric_frame(pd.read_csv(synthetic_path))
+
+    pretrain_model = PhysicsInformedLSTM(
+        sequence_length=PILSTM_SEQUENCE_LENGTH,
+        lstm_units=PILSTM_LSTM_UNITS,
+        learning_rate=PILSTM_LEARNING_RATE,
+        use_hard_energy_balance=True,
+    )
+    pretrain_model.physics_weight = PILSTM_PHYSICS_WEIGHT
+
+    X_seq, y_seq = create_grouped_sequence_dataset(pretrain_model, synthetic_df)
+    if len(X_seq) < 20:
+        return None
+
+    X_train, y_train, X_val, y_val, _, _ = split_sequence_data(X_seq, y_seq)
+    if min(len(X_train), len(X_val)) <= 0:
+        return None
+
+    pretrain_model.build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+    pretrain_model.train(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        epochs=PILSTM_SYNTHETIC_PRETRAIN_EPOCHS,
+        batch_size=PILSTM_SYNTHETIC_PRETRAIN_BATCH_SIZE,
+        verbose=0,
+    )
+
+    weights_path = results_dir / "pilstm_synthetic_pretrained.weights.h5"
+    pretrain_model.model.save_weights(weights_path)
+    _PRETRAINED_PILSTM_WEIGHTS_PATH = weights_path
+    return weights_path
+
+
 def evaluate_pilstm(
     subset_df: pd.DataFrame,
     subset_name: str,
@@ -301,6 +354,12 @@ def evaluate_pilstm(
         return [], []
 
     pilstm.build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+    pretrained_weights = ensure_pretrained_pilstm_weights(results_dir)
+    if pretrained_weights is not None and pretrained_weights.exists():
+        try:
+            pilstm.model.load_weights(str(pretrained_weights))
+        except Exception:
+            pass
     pilstm.train(
         X_train,
         y_train,
@@ -311,9 +370,25 @@ def evaluate_pilstm(
         verbose=1,
     )
 
+    val_pred = pilstm.predict(X_val)
+    val_hot_pred = val_pred[:, 0]
+    val_hot_true = y_val[:, 0]
+    if len(val_hot_pred) >= 2:
+        calibration_slope, calibration_intercept = np.polyfit(val_hot_pred, val_hot_true, 1)
+    else:
+        calibration_slope, calibration_intercept = 1.0, 0.0
+
     y_pred = pilstm.predict(X_test)
-    hot_metrics = compute_metrics(y_test[:, 0], y_pred[:, 0])
-    cold_metrics = compute_metrics(y_test[:, 1], y_pred[:, 1])
+    hot_pred = y_pred[:, 0] * calibration_slope + calibration_intercept
+    test_last_step = X_test[:, -1, :]
+    hot_inlet = test_last_step[:, 0]
+    cold_inlet = test_last_step[:, 1]
+    cold_flow = test_last_step[:, 2]
+    hot_flow = test_last_step[:, 6]
+    q_hot = hot_flow * pilstm.cp_hot * (hot_inlet - hot_pred)
+    cold_pred = q_hot / (cold_flow * pilstm.cp_cold + 1e-12) + cold_inlet
+    hot_metrics = compute_metrics(y_test[:, 0], hot_pred)
+    cold_metrics = compute_metrics(y_test[:, 1], cold_pred)
 
     weights_path = results_dir / f"{subset_name}_pilstm.weights.h5"
     pilstm.model.save_weights(weights_path)
@@ -328,8 +403,11 @@ def evaluate_pilstm(
         "scaler_X_scale": pilstm.scaler_X.scale_,
         "scaler_y_mean": pilstm.scaler_y.mean_,
         "scaler_y_scale": pilstm.scaler_y.scale_,
+        "hot_calibration_slope": float(calibration_slope),
+        "hot_calibration_intercept": float(calibration_intercept),
         "input_features": [
             "hot_inlet_temperature_k",
+            "cold_inlet_temperature_k",
             "cold_inlet_mass_flow_kg_s",
             "hx_1_heat_load_kw",
             "hot_outlet_pressure_pa",
@@ -380,7 +458,7 @@ def evaluate_pilstm(
         model_name="PI-LSTM",
         frame=test_frame,
         actual_values=y_test[:, 0],
-        predictions=y_pred[:, 0],
+        predictions=hot_pred,
     )
     return metric_rows, prediction_output_rows
 

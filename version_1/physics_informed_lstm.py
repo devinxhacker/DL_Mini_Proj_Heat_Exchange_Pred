@@ -88,8 +88,12 @@ class PhysicsInformedLSTM:
         return model
     
     def prepare_data(self, df_in):
+        df = df_in.copy()
+        if 'cold_inlet_temperature_k' not in df.columns:
+            df['cold_inlet_temperature_k'] = self.cold_inlet_temperature_k
         input_features = [
             'hot_inlet_temperature_k',
+            'cold_inlet_temperature_k',
             'cold_inlet_mass_flow_kg_s',
             'hx_1_heat_load_kw',
             'hot_outlet_pressure_pa',
@@ -102,8 +106,8 @@ class PhysicsInformedLSTM:
             'hot_outlet_temperature_k',
             'cold_outlet_temperature_k'
         ]
-        X = df_in[input_features].values
-        y = df_in[output_features].values
+        X = df[input_features].values
+        y = df[output_features].values
         return X, y
     
     def train(self, X_train, y_train, X_val, y_val, epochs=1000, batch_size=32, verbose=1):
@@ -141,11 +145,13 @@ class PhysicsInformedLSTM:
 
         # Indices in the input feature vector per prepare_data()
         # 0: hot_inlet_temperature_k
-        # 1: cold_inlet_mass_flow_kg_s
-        # 5: hot_outlet_mass_flow_kg_s or assumed hot flow
+        # 1: cold_inlet_temperature_k
+        # 2: cold_inlet_mass_flow_kg_s
+        # 6: hot_outlet_mass_flow_kg_s or assumed hot flow
         hot_inlet_idx = 0
-        cold_flow_idx = 1
-        hot_flow_idx = 5
+        cold_inlet_idx = 1
+        cold_flow_idx = 2
+        hot_flow_idx = 6
 
         for epoch in range(epochs):
             # Training
@@ -164,13 +170,12 @@ class PhysicsInformedLSTM:
 
                         # Use last-timestep inputs to compute cold outlet from energy balance
                         hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                        cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
                         cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
                         hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
 
                         Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
-                        cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + float(
-                            self.cold_inlet_temperature_k
-                        )
+                        cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + cold_inlet
                         preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
                     else:
                         # Unscale predictions to physical units: y = y_scaled * scale + mean
@@ -183,17 +188,16 @@ class PhysicsInformedLSTM:
 
                     # Compute energy balance gap per sample (compare Q_hot and Q_cold)
                     hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                    cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
                     cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
                     hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
-                    heat_load = tf.cast(X_orig_batch[:, -1, 2], tf.float32)
+                    heat_load = tf.cast(X_orig_batch[:, -1, 3], tf.float32)
 
                     hot_outlet_pred = preds_phys[:, 0]
                     cold_outlet_pred = preds_phys[:, 1]
 
                     Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_outlet_pred)
-                    Q_cold = cold_flow * float(self.cp_cold) * (
-                        cold_outlet_pred - float(self.cold_inlet_temperature_k)
-                    )
+                    Q_cold = cold_flow * float(self.cp_cold) * (cold_outlet_pred - cold_inlet)
 
                     # normalize energy gap by heat load magnitude to keep units comparable to temperature MSE
                     denom = tf.abs(heat_load) + 1e-6
@@ -216,12 +220,11 @@ class PhysicsInformedLSTM:
                     hot_mean = float(self.scaler_y.mean_[0])
                     hot_pred_phys = tf.reshape(preds_scaled[:, 0] * hot_scale + hot_mean, [-1])
                     hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                    cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
                     cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
                     hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
                     Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
-                    cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + float(
-                        self.cold_inlet_temperature_k
-                    )
+                    cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + cold_inlet
                     preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
                 else:
                     y_scale = tf.constant(self.scaler_y.scale_, dtype=tf.float32)
@@ -230,15 +233,14 @@ class PhysicsInformedLSTM:
 
                 mse_loss = tf.reduce_mean(tf.square(y_true_phys - preds_phys))
                 hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
                 cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
                 hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
-                heat_load = tf.cast(X_orig_batch[:, -1, 2], tf.float32)
+                heat_load = tf.cast(X_orig_batch[:, -1, 3], tf.float32)
                 hot_outlet_pred = preds_phys[:, 0]
                 cold_outlet_pred = preds_phys[:, 1]
                 Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_outlet_pred)
-                Q_cold = cold_flow * float(self.cp_cold) * (
-                    cold_outlet_pred - float(self.cold_inlet_temperature_k)
-                )
+                Q_cold = cold_flow * float(self.cp_cold) * (cold_outlet_pred - cold_inlet)
                 denom = tf.abs(heat_load) + 1e-6
                 rel_gap = tf.abs(Q_hot - Q_cold) / denom
                 physics_penalty = tf.reduce_mean(rel_gap)

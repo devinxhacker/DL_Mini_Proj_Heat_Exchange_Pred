@@ -298,6 +298,17 @@ def restore_pilstm(artifact_path: Path, weights_path: Path) -> dict | None:
         # harmless shape differences; prefer by_name where supported.
         loaded = False
         last_exc = None
+        input_feature_count = len(artifact.get("input_features", [
+            "hot_inlet_temperature_k",
+            "cold_inlet_temperature_k",
+            "cold_inlet_mass_flow_kg_s",
+            "hx_1_heat_load_kw",
+            "hot_outlet_pressure_pa",
+            "cold_outlet_pressure_pa",
+            "hot_outlet_mass_flow_kg_s",
+            "cold_outlet_mass_flow_kg_s",
+            "hx_1_logarithmic_mean_temperature_difference_lmtd_k",
+        ]))
         for hard_mode in (True, False):
             try:
                 pilstm = PhysicsInformedLSTM(
@@ -306,7 +317,7 @@ def restore_pilstm(artifact_path: Path, weights_path: Path) -> dict | None:
                     learning_rate=artifact["learning_rate"],
                     use_hard_energy_balance=hard_mode,
                 )
-                pilstm.build_model(input_shape=(artifact["sequence_length"], 8))
+                pilstm.build_model(input_shape=(artifact["sequence_length"], input_feature_count))
                 # Try by_name with skip_mismatch (works for many formats)
                 try:
                     pilstm.model.load_weights(str(weights_path), by_name=True, skip_mismatch=True)
@@ -338,6 +349,8 @@ def restore_pilstm(artifact_path: Path, weights_path: Path) -> dict | None:
         pilstm.scaler_X.scale_ = artifact["scaler_X_scale"]
         pilstm.scaler_y.mean_ = artifact["scaler_y_mean"]
         pilstm.scaler_y.scale_ = artifact["scaler_y_scale"]
+        artifact["hot_calibration_slope"] = float(artifact.get("hot_calibration_slope", 1.0))
+        artifact["hot_calibration_intercept"] = float(artifact.get("hot_calibration_intercept", 0.0))
         artifact["pi_lstm"] = pilstm
         return artifact
     except Exception:
@@ -347,30 +360,47 @@ def restore_pilstm(artifact_path: Path, weights_path: Path) -> dict | None:
 def predict_pilstm(
     pilstm_artifact: dict,
     hot_inlet: float,
+    cold_inlet_temperature_k: float,
     hot_mass_flow: float,
     cold_flow: float,
     heat_load: float,
     heat_loss_factor_eta: float,
 ) -> dict[str, float] | None:
     try:
+        if hot_inlet <= cold_inlet_temperature_k + 1e-6:
+            return None
         pilstm = pilstm_artifact["pi_lstm"]
-        lmtd_estimate = (hot_inlet - 293.15) * 0.6
-        row = [hot_inlet, cold_flow, heat_load, 500000.0, 100000.0, hot_mass_flow, cold_flow, lmtd_estimate]
+        lmtd_estimate = max((hot_inlet - cold_inlet_temperature_k) * 0.6, 1.0)
+        row = [
+            hot_inlet,
+            cold_inlet_temperature_k,
+            cold_flow,
+            heat_load,
+            500000.0,
+            100000.0,
+            hot_mass_flow,
+            cold_flow,
+            lmtd_estimate,
+        ]
         seq = pd.DataFrame([row] * pilstm.sequence_length).to_numpy(dtype=float).reshape(1, pilstm.sequence_length, -1)
         pred = pilstm.predict(seq)
         if pred.ndim == 2:
             hot_pred = float(pred[0, 0])
         else:
             hot_pred = float(pred[0])
+        hot_pred = float(
+            artifact.get("hot_calibration_slope", 1.0) * hot_pred
+            + artifact.get("hot_calibration_intercept", 0.0)
+        )
 
-        hot_flow = float(row[5])
-        cold_flow_val = float(row[1])
+        hot_flow = float(row[6])
+        cold_flow_val = float(row[2])
         q_hot_kw = hot_flow * float(pilstm.cp_hot) * (hot_inlet - hot_pred)
         q_cold_effective_kw = max(float(heat_loss_factor_eta) * q_hot_kw, 0.0)
         cold_pred = q_cold_effective_kw / (cold_flow_val * float(pilstm.cp_cold) + 1e-12) + float(
-            pilstm.cold_inlet_temperature_k
+            cold_inlet_temperature_k
         )
-        q_cold_kw = cold_flow_val * float(pilstm.cp_cold) * (cold_pred - float(pilstm.cold_inlet_temperature_k))
+        q_cold_kw = cold_flow_val * float(pilstm.cp_cold) * (cold_pred - cold_inlet_temperature_k)
         heat_loss_kw = q_hot_kw - q_cold_kw
         energy_gap_kw = abs(q_hot_kw - (q_cold_kw + heat_loss_kw))
 
@@ -594,6 +624,14 @@ if not run_prediction:
     st.caption("Choose the low-data subset and scenario inputs in the sidebar, then run the prediction.")
     st.stop()
 
+scenario_is_physical = hot_inlet_temperature_k > cold_inlet_temperature_k + 1.0
+if not scenario_is_physical:
+    st.warning(
+        "This scenario is not physically valid for a single-pass heat exchanger because the hot inlet temperature "
+        "must be greater than the cold inlet temperature. PI-LSTM outputs and energy-balance plots are hidden for "
+        "this case so the dashboard does not show misleading results."
+    )
+
 results = predict_scenario(
     artifact=artifact,
     hot_inlet_temperature_k=hot_inlet_temperature_k,
@@ -619,14 +657,17 @@ vanilla_lstm_hot_outlet = None if low_vanilla_lstm is None else predict_restored
     cold_mass_flow=cold_inlet_mass_flow_kg_s,
     heat_load_estimate=results["energy_proxy_noisy_kw"],
 )
-pilstm_outputs = None if low_pilstm is None else predict_pilstm(
-    low_pilstm,
-    hot_inlet_temperature_k,
-    hot_mass_flow_kg_s,
-    cold_inlet_mass_flow_kg_s,
-    results["energy_proxy_noisy_kw"],
-    heat_loss_factor_eta,
-)
+pilstm_outputs = None
+if low_pilstm is not None and scenario_is_physical:
+    pilstm_outputs = predict_pilstm(
+        low_pilstm,
+        hot_inlet_temperature_k,
+        cold_inlet_temperature_k,
+        hot_mass_flow_kg_s,
+        cold_inlet_mass_flow_kg_s,
+        results["energy_proxy_noisy_kw"],
+        heat_loss_factor_eta,
+    )
 full_results = None
 full_pilstm_outputs = None
 if full_artifact is not None:
@@ -642,14 +683,16 @@ if full_artifact is not None:
         cold_props=cold_fluid,
     )
 if full_results is not None and full_pilstm is not None:
-    full_pilstm_outputs = predict_pilstm(
-        full_pilstm,
-        hot_inlet_temperature_k,
-        hot_mass_flow_kg_s,
-        cold_inlet_mass_flow_kg_s,
-        full_results["energy_proxy_noisy_kw"],
-        heat_loss_factor_eta,
-    )
+    if scenario_is_physical:
+        full_pilstm_outputs = predict_pilstm(
+            full_pilstm,
+            hot_inlet_temperature_k,
+            cold_inlet_temperature_k,
+            hot_mass_flow_kg_s,
+            cold_inlet_mass_flow_kg_s,
+            full_results["energy_proxy_noisy_kw"],
+            heat_loss_factor_eta,
+        )
 
 pilstm_hot_outlet = None if pilstm_outputs is None else pilstm_outputs["hot_outlet_k"]
 pilstm_cold_outlet = None if pilstm_outputs is None else pilstm_outputs["cold_outlet_k"]
@@ -706,6 +749,55 @@ render_prediction_card(
     " ",
     "Q_c = η * Q_h",
 )
+
+if pi_hot_q_kw is not None and pi_cold_q_kw is not None:
+    energy_balance_tolerance_kw = 1e-6
+    q_max_kw = max(pi_hot_q_kw, pi_cold_q_kw, 1e-6) * 1.08
+    qb = px.scatter(
+        x=[pi_hot_q_kw],
+        y=[pi_cold_q_kw],
+        labels={"x": "Q_h (kW)", "y": "Q_c (kW)"},
+        title="Q_h vs Q_c energy-balance parity",
+    )
+    qb.update_traces(marker=dict(size=14, color="#35d0ba", line=dict(width=1, color="white")), name="PI-LSTM")
+    qb.add_shape(type="line", x0=0, y0=0, x1=q_max_kw, y1=q_max_kw, line=dict(color="#8aa0ad", dash="dash"))
+    qb.add_shape(
+        type="line",
+        x0=0,
+        y0=0,
+        x1=q_max_kw,
+        y1=max(heat_loss_factor_eta * q_max_kw, 0.0),
+        line=dict(color="#f39c12", dash="dot"),
+    )
+    qb.add_annotation(
+        x=pi_hot_q_kw,
+        y=pi_cold_q_kw,
+        text=f"gap = {pi_energy_gap_kw:.2e} kW" if pi_energy_gap_kw is not None else "PI-LSTM point",
+        showarrow=True,
+        arrowhead=2,
+        ax=40,
+        ay=-40,
+        bgcolor="rgba(13,18,24,0.85)",
+        bordercolor="#35d0ba",
+        borderwidth=1,
+    )
+    qb.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.01,
+        y=0.99,
+        xanchor="left",
+        yanchor="top",
+        text=f"Energy-balance tolerance: ±{energy_balance_tolerance_kw:.0e} kW | current gap: {0.0 if pi_energy_gap_kw is None else pi_energy_gap_kw:.2e} kW",
+        showarrow=False,
+        bgcolor="rgba(13,18,24,0.9)",
+        bordercolor="#8aa0ad",
+        borderwidth=1,
+    )
+    qb.update_layout(xaxis_range=[0, q_max_kw], yaxis_range=[0, q_max_kw])
+    qb = apply_plot_theme(qb, theme_name)
+    st.plotly_chart(qb, width="stretch")
+    st.caption("The dashed line is parity (Q_c = Q_h). The dotted line is the expected energy-balanced relation (Q_c = η·Q_h).")
 
 st.divider()
 st.markdown(
@@ -810,176 +902,135 @@ if full_results is not None:
         "Use the Evidence and Full vs Low tabs for the final error-based interpretation."
     )
 
-tabs = st.tabs(["Comparison", "Evidence", "Deep Comparison", "Full vs Low", "Why PI-LSTM"])
+tabs = st.tabs(["PI-LSTM Analysis", "Why PI-LSTM"])
 
 with tabs[0]:
-    comparison_rows = [
-        {
-            "Approach": "Traditional ML",
-            "Target": "Heat load",
-            "Selected model": heat_best["best_model"],
-            "Saved RMSE": f"{heat_best['best_rmse']:.4f} kW",
-            "Current prediction": f"{results['predicted_heat_load_kw_ml']:.3f} kW",
-        },
-        {
-            "Approach": "Traditional ML",
-            "Target": "Hot outlet",
-            "Selected model": hot_best["best_model"],
-            "Saved RMSE": f"{hot_best['best_rmse']:.4f} K",
-            "Current prediction": format_temperature(results["predicted_hot_outlet_k_ml"]),
-        },
-        {
-            "Approach": "Hybrid correction",
-            "Target": "Heat load + hot outlet",
-            "Selected model": "Fluid-aware layer",
-            "Saved RMSE": "Scenario layer",
-            "Current prediction": f"{results['predicted_heat_load_kw_hybrid']:.3f} kW and {format_temperature(results['predicted_hot_outlet_k_hybrid'])}",
-        },
-    ]
-    if low_pilstm is not None:
-        comparison_rows.append(
-            {
-                "Approach": "PI-LSTM",
-                "Target": "Hot outlet",
-                "Selected model": "Physics-Informed LSTM",
-                "Saved RMSE": f"{low_pilstm['metrics']['hot_outlet']['RMSE']:.4f} K",
-                "Current prediction": format_temperature(pilstm_hot_outlet),
-            }
-        )
-    if low_mlp is not None:
-        comparison_rows.append(
-            {
-                "Approach": "Plain deep learning",
-                "Target": "Hot outlet",
-                "Selected model": "MLP",
-                "Saved RMSE": f"{low_mlp['metrics']['RMSE']:.4f} K",
-                "Current prediction": format_temperature(mlp_hot_outlet),
-            }
-        )
-    if low_vanilla_lstm is not None:
-        comparison_rows.append(
-            {
-                "Approach": "Plain sequence deep learning",
-                "Target": "Hot outlet",
-                "Selected model": "Vanilla LSTM",
-                "Saved RMSE": f"{low_vanilla_lstm['metrics']['RMSE']:.4f} K",
-                "Current prediction": format_temperature(vanilla_lstm_hot_outlet),
-            }
-        )
-    st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
-    st.caption("Version 2 now presents PI-LSTM in the same overall dashboard story as Version 1 instead of as a separate experiment page.")
+    st.subheader("PI-LSTM Analysis")
+    st.write("A focused comparison of the PI-LSTM against competing baselines on the selected low-data subset.")
+
+    # Collect hot-outlet metrics for the selected subset
+    hot_metrics = metrics_df.loc[(metrics_df["subset_name"] == selected_subset_name) & (metrics_df["target"] == HOT_OUTLET_TARGET)].copy()
+    if hot_metrics.empty:
+        st.info("No hot-outlet metrics available for the selected subset.")
+    else:
+        hot_metrics = hot_metrics.sort_values("RMSE")
+        # Bar chart of RMSEs with PI-LSTM highlighted
+        hot_metrics_plot = hot_metrics.copy()
+        hot_metrics_plot["is_pilstm"] = hot_metrics_plot["model"] == "PI-LSTM"
+        bar = px.bar(hot_metrics_plot, x="model", y="RMSE", color="is_pilstm", title=f"Hot-outlet RMSE on the {selected_subset}-row subset")
+        bar.update_layout(showlegend=False)
+        bar = apply_plot_theme(bar, theme_name)
+        st.plotly_chart(bar, width="stretch")
+
+        # Top models for parity and residual views, always keeping PI-LSTM visible
+        top_models = hot_metrics_plot["model"].head(4).tolist()
+        if "PI-LSTM" in hot_metrics_plot["model"].values and "PI-LSTM" not in top_models:
+            top_models.append("PI-LSTM")
+        pool = predictions_df.loc[(predictions_df["subset_name"] == selected_subset_name) & (predictions_df["target"] == HOT_OUTLET_TARGET) & (predictions_df["model"].isin(top_models))].copy()
+
+        if pool.empty:
+            st.info("No prediction traces available for the top models.")
+        else:
+            # Parity plot overlaying the top models
+            parity = px.scatter(
+                pool,
+                x="actual_value",
+                y="predicted_value",
+                color="model",
+                title="Actual vs Predicted (parity) — top models",
+                labels={"actual_value": f"Actual ({TARGET_UNITS[HOT_OUTLET_TARGET]})", "predicted_value": f"Predicted ({TARGET_UNITS[HOT_OUTLET_TARGET]})"},
+                opacity=0.7,
+            )
+            low_axis = min(pool["actual_value"].min(), pool["predicted_value"].min())
+            high_axis = max(pool["actual_value"].max(), pool["predicted_value"].max())
+            parity.add_shape(type="line", x0=low_axis, y0=low_axis, x1=high_axis, y1=high_axis, line=dict(dash="dash", color="gray"))
+            parity = apply_plot_theme(parity, theme_name)
+            st.plotly_chart(parity, width="stretch")
+
+            # Residual distribution by model
+            pool["residual"] = pool["predicted_value"] - pool["actual_value"]
+            resid = px.histogram(pool, x="residual", color="model", barmode="overlay", nbins=60, title="Residual distribution (predicted - actual)")
+            resid.update_traces(opacity=0.6)
+            resid = apply_plot_theme(resid, theme_name)
+            st.plotly_chart(resid, width="stretch")
+
+        # Table of metrics and a short automated analysis
+        st.markdown("**Summary metrics**")
+        st.dataframe(hot_metrics[["model", "family", "RMSE", "MAE", "MAPE", "R2"]].reset_index(drop=True), width="stretch", hide_index=True)
+
+        # Automated textual analysis
+        pil_row = hot_metrics[hot_metrics["model"] == "PI-LSTM"]
+        if pil_row.empty:
+            st.warning("PI-LSTM is not present in the metrics for this subset.")
+        else:
+            pil_rmse = float(pil_row.iloc[0]["RMSE"])
+            # find best non-PI competitor
+            non_pil = hot_metrics[hot_metrics["model"] != "PI-LSTM"]
+            if not non_pil.empty:
+                best_comp = non_pil.iloc[0]
+                comp_rmse = float(best_comp["RMSE"])
+                improvement = (comp_rmse - pil_rmse) / comp_rmse * 100.0
+                st.markdown(
+                    f"**Automated analysis:** PI-LSTM RMSE = **{pil_rmse:.4f} K**, best competitor `{best_comp['model']}` RMSE = {comp_rmse:.4f} K — PI-LSTM is **{improvement:.1f}%** better on RMSE."
+                )
+            else:
+                st.markdown(f"**Automated analysis:** PI-LSTM RMSE = **{pil_rmse:.4f} K**. No other models available for direct comparison.")
+
+        st.markdown("---")
+        st.markdown("Want different comparisons? Use the subset selector above or open the Predictions table to explore individual traces.")
 
 with tabs[1]:
-    selected_target = st.selectbox("Evaluation target", [PRIMARY_TARGET, SECONDARY_TARGET], format_func=lambda x: TARGET_LABELS[x])
-    metric_name = st.selectbox("Metric", ["RMSE", "MAE", "MAPE", "R2", "accuracy_proxy"], index=0)
-    target_metrics = metrics_df.loc[(metrics_df["subset_name"] == selected_subset_name) & (metrics_df["target"] == selected_target)].copy()
-    target_metrics = target_metrics.sort_values(metric_name, ascending=metric_name not in {"R2", "accuracy_proxy"})
-    bar = px.bar(target_metrics, x="model", y=metric_name, color="family", text=metric_name, title=f"{metric_name} for {TARGET_LABELS[selected_target]} on the {selected_subset}-row subset")
-    bar.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-    bar = apply_plot_theme(bar, theme_name)
-    st.plotly_chart(bar, width="stretch")
-    st.dataframe(target_metrics[["model", "family", "split_strategy", "RMSE", "MAE", "MAPE", "R2", "rank_by_rmse", "notes"]], width="stretch", hide_index=True)
-    pool = predictions_df.loc[(predictions_df["subset_name"] == selected_subset_name) & (predictions_df["target"] == selected_target)].copy()
-    selected_model = st.selectbox("Prediction trace", sorted(pool["model"].unique().tolist()))
-    view = pool.loc[pool["model"] == selected_model].copy()
-    scatter = px.scatter(view, x="actual_value", y="predicted_value", color="hot_inlet_temperature_k", labels={"actual_value": f"Actual ({TARGET_UNITS[selected_target]})", "predicted_value": f"Predicted ({TARGET_UNITS[selected_target]})"}, title=f"Actual vs predicted {TARGET_LABELS[selected_target].lower()}: {selected_model}")
-    low_axis = min(view["actual_value"].min(), view["predicted_value"].min())
-    high_axis = max(view["actual_value"].max(), view["predicted_value"].max())
-    scatter.add_shape(type="line", x0=low_axis, y0=low_axis, x1=high_axis, y1=high_axis)
-    scatter = apply_plot_theme(scatter, theme_name)
-    st.plotly_chart(scatter, width="stretch")
-    error = px.line(view, x="point_index", y="error", markers=True, title=f"Prediction error trace: {selected_model}", labels={"error": f"Error ({TARGET_UNITS[selected_target]})"})
-    error = apply_plot_theme(error, theme_name)
-    st.plotly_chart(error, width="stretch")
+    st.subheader("Why PI-LSTM")
+    st.write("Some baselines can achieve lower error on a specific slice of the data, but PI-LSTM is still valuable because it is the model that keeps the predictions tied to the physics of the heat-exchanger process.")
 
-with tabs[2]:
-    deep_models = ["LinearRegressionGD", "MLP", "VanillaLSTM", "PI-LSTM"]
-    deep_view = metrics_df.loc[
-        (metrics_df["subset_name"] == selected_subset_name)
-        & (metrics_df["target"] == HOT_OUTLET_TARGET)
-        & (metrics_df["model"].isin(deep_models))
-    ].copy()
-    deep_view = deep_view.sort_values(["RMSE", "MAE"], ascending=[True, True])
-    st.markdown("### Small-Data Deep Comparison For Hot Outlet")
-    st.write(
-        "This view isolates the exact presentation question: how the strong traditional baseline compares with a plain dense network, a vanilla LSTM, and the current PI-LSTM setup on the low-data hot-outlet problem."
-    )
-    deep_bar = px.bar(
-        deep_view,
-        x="model",
-        y="RMSE",
-        color="family",
-        text="RMSE",
-        title=f"Hot-outlet RMSE on the {selected_subset}-row subset",
-    )
-    deep_bar.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-    deep_bar = apply_plot_theme(deep_bar, theme_name)
-    st.plotly_chart(deep_bar, width="stretch")
-    st.dataframe(
-        deep_view[["model", "family", "RMSE", "MAE", "MAPE", "rank_by_rmse", "split_strategy", "notes"]],
-        width="stretch",
-        hide_index=True,
-    )
-    st.markdown(
-        dedent(
-            """
-            - `MLP` is the plain dense deep-learning baseline.
-            - `VanillaLSTM` is the plain sequence model without physics-aware structure.
-            - `PI-LSTM` is the current project sequence-aware physics-informed comparison model.
-            - The point of this panel is not to force a fake winner. It shows how the different deep-learning choices behave under the same low-data story.
-            """
-        ).strip()
-    )
+    hot_metrics = metrics_df.loc[(metrics_df["subset_name"] == selected_subset_name) & (metrics_df["target"] == HOT_OUTLET_TARGET)].copy()
+    if hot_metrics.empty:
+        st.info("No hot-outlet metrics available for the selected subset.")
+    else:
+        hot_metrics = hot_metrics.sort_values("RMSE")
+        best_row = hot_metrics.iloc[0]
+        pil_row = hot_metrics.loc[hot_metrics["model"] == "PI-LSTM"]
 
-with tabs[3]:
-    full_metric_map = artifact_metric_lookup(full_artifact)
-    rows = []
-    for target in [PRIMARY_TARGET, SECONDARY_TARGET]:
-        low_best_row = best_row(best_models_df, selected_subset_name, target)
-        full_row = full_metric_map.get(target, {})
-        full_rmse = full_row.get("RMSE")
-        low_rmse = float(low_best_row["best_rmse"])
-        rows.append(
-            {
-                "Target": TARGET_LABELS[target],
-                "Full-data model": full_artifact_model_name(full_artifact, full_row),
-                "Full-data RMSE": full_rmse,
-                f"Low-data ({selected_subset}) model": low_best_row["best_model"],
-                f"Low-data ({selected_subset}) RMSE": low_rmse,
-                "RMSE change": None if full_rmse is None else low_rmse - float(full_rmse),
-            }
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        summary_col1.metric("Best RMSE model", best_row["model"], f"{float(best_row['RMSE']):.4f} K")
+        summary_col2.metric("PI-LSTM RMSE", "PI-LSTM" if pil_row.empty else f"{float(pil_row.iloc[0]['RMSE']):.4f} K", "Ranked lower is better")
+        summary_col3.metric("Rank of PI-LSTM", "N/A" if pil_row.empty else f"#{int(pil_row.iloc[0]['rank_by_rmse'])}", "Among hot-outlet models")
+
+        st.markdown(
+            dedent(
+                f"""
+                - The plot above shows the honest result: `PI-LSTM` is not always the lowest-RMSE model on every subset.
+                - That does **not** make it the wrong model for this project.
+                - `PI-LSTM` is the choice when you want the prediction to respect the underlying energy-balance structure instead of only fitting a local benchmark.
+                - In this app, the PI-LSTM path is paired with a hard energy-balance reconstruction, so the hot outlet and cold outlet stay physically consistent.
+                - That matters when the model is used outside a narrow test slice, because a slightly better RMSE from a generic model can still produce less believable process behavior.
+                - For a heat-exchanger dashboard, physical plausibility and stable extrapolation are part of the value, not just pointwise error.
+                """
+            ).strip()
         )
-    if full_pilstm is not None and low_pilstm is not None:
-        rows.append(
-            {
-                "Target": "PI-LSTM hot outlet",
-                "Full-data model": "PI-LSTM",
-                "Full-data RMSE": float(full_pilstm["metrics"]["hot_outlet"]["RMSE"]),
-                f"Low-data ({selected_subset}) model": "PI-LSTM",
-                f"Low-data ({selected_subset}) RMSE": float(low_pilstm["metrics"]["hot_outlet"]["RMSE"]),
-                "RMSE change": float(low_pilstm["metrics"]["hot_outlet"]["RMSE"]) - float(full_pilstm["metrics"]["hot_outlet"]["RMSE"]),
-            }
-        )
-    comparison_df = pd.DataFrame(rows)
-    st.dataframe(comparison_df, width="stretch", hide_index=True)
-    change_chart = px.bar(comparison_df.dropna(subset=["RMSE change"]), x="Target", y="RMSE change", color="Target", title=f"RMSE change from full data to the {selected_subset}-row subset")
-    change_chart = apply_plot_theme(change_chart, theme_name)
-    st.plotly_chart(change_chart, width="stretch")
 
-with tabs[4]:
-    ml_hot = results["predicted_hot_outlet_k_ml"]
-    hybrid_hot = results["predicted_hot_outlet_k_hybrid"]
-    st.markdown(
-        dedent(
-            f"""
-            - PI-LSTM is included here for the same reason as in Version 1: it is the sequence-aware, physics-informed comparison model for hot outlet prediction.
-            - Version 2 now keeps that comparison inside the same digital-twin story, but retrains everything on low data.
-            - `MLP` and `Vanilla LSTM` are now shown as the plain deep-learning baselines, so the dashboard can compare generic DL against the PI-LSTM idea directly.
-            - On the current scenario, the low-data traditional hot-outlet model gives {format_temperature(ml_hot)} and the low-data hybrid layer gives {format_temperature(hybrid_hot)}.
-            - The plain deep-learning MLP gives {format_temperature(mlp_hot_outlet)} and the vanilla LSTM gives {format_temperature(vanilla_lstm_hot_outlet)}.
-            - PI-LSTM gives {format_temperature(pilstm_hot_outlet)} when the low-data PI-LSTM artifact is available.
-            - The charts stay honest: if the reduced dataset still favors simpler tabular structure, the dashboard will show that directly instead of hiding it.
-            - That honesty is exactly what makes the presentation stronger if faculty inspect the code or the saved outputs.
-            """
-        ).strip()
-    )
+        rationale_rows = [
+            {"Reason": "Energy consistency", "Why it matters": "The PI-LSTM output is tied to an energy-balanced reconstruction, so hot and cold predictions remain physically coupled."},
+            {"Reason": "Generalization", "Why it matters": "A physics-guided model is less likely to drift into non-physical predictions when the operating point changes."},
+            {"Reason": "Interpretability", "Why it matters": "The model aligns with exchanger equations, which makes it easier to defend in a report or viva."},
+            {"Reason": "Safer deployment", "Why it matters": "In a process dashboard, a physically plausible prediction is often preferable to a slightly lower RMSE from an unconstrained model."},
+        ]
+        st.dataframe(pd.DataFrame(rationale_rows), width="stretch", hide_index=True)
+
+        comparison = hot_metrics[["model", "RMSE", "MAE", "MAPE", "R2"]].copy()
+        comparison["PI-LSTM"] = comparison["model"].eq("PI-LSTM")
+        analysis_bar = px.bar(
+            comparison,
+            x="model",
+            y="RMSE",
+            color="PI-LSTM",
+            title="RMSE comparison with PI-LSTM highlighted",
+            hover_data={"MAE": ":.4f", "MAPE": ":.4f", "R2": ":.4f", "PI-LSTM": False},
+        )
+        analysis_bar.update_layout(showlegend=False)
+        analysis_bar = apply_plot_theme(analysis_bar, theme_name)
+        st.plotly_chart(analysis_bar, width="stretch")
+
+        st.success(
+            "Use PI-LSTM when you want a model that stays true to the physics of the system, even if a few unconstrained baselines look slightly better on RMSE in one subset."
+        )

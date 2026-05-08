@@ -39,13 +39,15 @@ class PhysicsInformedLSTM:
     def __init__(
         self,
         sequence_length=10,
-        lstm_units=64,
+        lstm_units=128,
         learning_rate=0.001,
         physics_weight: float = 1.0,
         cp_hot_kj_kgk: float = 4.18,
         cp_cold_kj_kgk: float = 4.18,
         cold_inlet_temperature_k: float = 293.15,
         use_hard_energy_balance: bool = False,
+        residual_learning: bool = True,
+        use_bidirectional: bool = True,
     ):
         self.sequence_length = sequence_length
         self.lstm_units = lstm_units
@@ -58,7 +60,11 @@ class PhysicsInformedLSTM:
         self.model = None
         self.scaler_X = StandardScaler()
         self.scaler_y = StandardScaler()
+        # scaler for residual target (hot residual when residual_learning=True)
+        self.scaler_residual = StandardScaler()
         self.history = None
+        self.residual_learning = bool(residual_learning)
+        self.use_bidirectional = bool(use_bidirectional)
         
     def create_sequences(self, X, y):
         X_seq, y_seq = [], []
@@ -69,16 +75,25 @@ class PhysicsInformedLSTM:
     
     def build_model(self, input_shape):
         inputs = layers.Input(shape=input_shape)
-        x = layers.LSTM(self.lstm_units, return_sequences=True)(inputs)
-        x = layers.Dropout(0.2)(x)
-        x = layers.LSTM(self.lstm_units // 2, return_sequences=True)(x)
-        x = layers.Dropout(0.2)(x)
-        x = layers.LSTM(self.lstm_units // 4, return_sequences=False)(x)
-        x = layers.Dropout(0.2)(x)
+        # stack of LSTM layers (optionally bidirectional)
+        if self.use_bidirectional:
+            x = layers.Bidirectional(layers.LSTM(self.lstm_units, return_sequences=True))(inputs)
+            x = layers.Dropout(0.2)(x)
+            x = layers.Bidirectional(layers.LSTM(self.lstm_units // 2, return_sequences=True))(x)
+            x = layers.Dropout(0.2)(x)
+            x = layers.Bidirectional(layers.LSTM(self.lstm_units // 4, return_sequences=False))(x)
+            x = layers.Dropout(0.2)(x)
+        else:
+            x = layers.LSTM(self.lstm_units, return_sequences=True)(inputs)
+            x = layers.Dropout(0.2)(x)
+            x = layers.LSTM(self.lstm_units // 2, return_sequences=True)(x)
+            x = layers.Dropout(0.2)(x)
+            x = layers.LSTM(self.lstm_units // 4, return_sequences=False)(x)
+            x = layers.Dropout(0.2)(x)
         x = layers.Dense(32, activation='relu')(x)
         x = layers.Dense(16, activation='relu')(x)
         # if using hard energy-balance, predict only hot outlet and compute cold outlet from energy balance
-        out_dims = 1 if self.use_hard_energy_balance else 2
+        out_dims = 1 if self.use_hard_energy_balance or self.residual_learning else 2
         outputs = layers.Dense(out_dims, activation='linear')(x)
         model = keras.Model(inputs=inputs, outputs=outputs)
         optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
@@ -122,18 +137,51 @@ class PhysicsInformedLSTM:
 
         y_train_orig = np.asarray(y_train, dtype=float)
         y_val_orig = np.asarray(y_val, dtype=float)
-        y_train_scaled = self.scaler_y.fit_transform(y_train_orig)
-        y_val_scaled = self.scaler_y.transform(y_val_orig)
+        # If residual learning, compute residual targets for hot outlet: residual = true_hot - baseline_hot
+        # Indices in the input feature vector per prepare_data()
+        # 0: hot_inlet_temperature_k
+        # 1: cold_inlet_temperature_k
+        # 2: cold_inlet_mass_flow_kg_s
+        # 6: hot_outlet_mass_flow_kg_s or assumed hot flow
+        hot_inlet_idx = 0
+        cold_inlet_idx = 1
+        cold_flow_idx = 2
+        hot_flow_idx = 6
+
+        if self.residual_learning:
+            # compute baseline hot from last-step inputs for each sequence
+            def compute_baseline(X_orig):
+                hot_inlet = X_orig[:, -1, hot_inlet_idx]
+                hot_flow = X_orig[:, -1, hot_flow_idx]
+                heat_load = X_orig[:, -1, 3]
+                # baseline_hot = hot_inlet - heat_load / (hot_flow * cp_hot)
+                denom = (hot_flow * float(self.cp_hot)) + 1e-12
+                baseline_hot = hot_inlet - (heat_load / denom)
+                return baseline_hot.reshape(-1, 1)
+
+            # compute baselines
+            baseline_train = compute_baseline(X_train_orig)
+            baseline_val = compute_baseline(X_val_orig)
+
+            y_train_residual = (y_train_orig[:, 0].reshape(-1, 1) - baseline_train)
+            y_val_residual = (y_val_orig[:, 0].reshape(-1, 1) - baseline_val)
+
+            y_train_scaled = self.scaler_residual.fit_transform(y_train_residual)
+            y_val_scaled = self.scaler_residual.transform(y_val_residual)
+        else:
+            y_train_scaled = self.scaler_y.fit_transform(y_train_orig)
+            y_val_scaled = self.scaler_y.transform(y_val_orig)
 
         # Create datasets that yield both scaled inputs (for the model) and original inputs (for physics)
         # Use drop_remainder so batch shapes are consistent (avoids retracing/OutOfRange warnings)
+        # keep partial batches for validation so small val sets are not dropped
         train_ds = tf.data.Dataset.from_tensor_slices(
             (X_train_scaled, X_train_orig, y_train_scaled, y_train_orig)
-        ).shuffle(1024).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+        ).shuffle(1024).batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
 
         val_ds = tf.data.Dataset.from_tensor_slices(
             (X_val_scaled, X_val_orig, y_val_scaled, y_val_orig)
-        ).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+        ).batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
 
         optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
 
@@ -162,8 +210,29 @@ class PhysicsInformedLSTM:
 
                     # Build predicted physical outputs depending on mode
                     y_true_phys = tf.cast(y_orig_batch, tf.float32)
-                    if self.use_hard_energy_balance:
-                        # preds_scaled: (batch,1) => hot outlet only
+                    if self.residual_learning:
+                        # preds_scaled are residual predictions for hot outlet
+                        res_scale = tf.constant(self.scaler_residual.scale_[0], dtype=tf.float32)
+                        res_mean = tf.constant(self.scaler_residual.mean_[0], dtype=tf.float32)
+                        hot_residual = tf.reshape(preds_scaled[:, 0] * res_scale + res_mean, [-1])
+
+                        # compute baseline from last timestep inputs
+                        hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                        hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+                        heat_load = tf.cast(X_orig_batch[:, -1, 3], tf.float32)
+                        denom = (hot_flow * float(self.cp_hot)) + 1e-12
+                        baseline_hot = hot_inlet - (heat_load / denom)
+
+                        hot_pred_phys = baseline_hot + hot_residual
+
+                        # derive cold outlet via energy balance
+                        cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
+                        cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                        Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
+                        cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + cold_inlet
+                        preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
+                    elif self.use_hard_energy_balance:
+                        # preds_scaled: (batch,1) => hot outlet only (absolute)
                         hot_scale = float(self.scaler_y.scale_[0])
                         hot_mean = float(self.scaler_y.mean_[0])
                         hot_pred_phys = tf.reshape(preds_scaled[:, 0] * hot_scale + hot_mean, [-1])
@@ -215,7 +284,22 @@ class PhysicsInformedLSTM:
             for X_scaled_batch, X_orig_batch, y_scaled_batch, y_orig_batch in val_ds:
                 preds_scaled = self.model(X_scaled_batch, training=False)
                 y_true_phys = tf.cast(y_orig_batch, tf.float32)
-                if self.use_hard_energy_balance:
+                if self.residual_learning:
+                    res_scale = tf.constant(self.scaler_residual.scale_[0], dtype=tf.float32)
+                    res_mean = tf.constant(self.scaler_residual.mean_[0], dtype=tf.float32)
+                    hot_residual = tf.reshape(preds_scaled[:, 0] * res_scale + res_mean, [-1])
+                    hot_inlet = tf.cast(X_orig_batch[:, -1, hot_inlet_idx], tf.float32)
+                    hot_flow = tf.cast(X_orig_batch[:, -1, hot_flow_idx], tf.float32)
+                    heat_load = tf.cast(X_orig_batch[:, -1, 3], tf.float32)
+                    denom = (hot_flow * float(self.cp_hot)) + 1e-12
+                    baseline_hot = hot_inlet - (heat_load / denom)
+                    hot_pred_phys = baseline_hot + hot_residual
+                    cold_inlet = tf.cast(X_orig_batch[:, -1, cold_inlet_idx], tf.float32)
+                    cold_flow = tf.cast(X_orig_batch[:, -1, cold_flow_idx], tf.float32)
+                    Q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred_phys)
+                    cold_pred_phys = Q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + cold_inlet
+                    preds_phys = tf.stack([hot_pred_phys, cold_pred_phys], axis=1)
+                elif self.use_hard_energy_balance:
                     hot_scale = float(self.scaler_y.scale_[0])
                     hot_mean = float(self.scaler_y.mean_[0])
                     hot_pred_phys = tf.reshape(preds_scaled[:, 0] * hot_scale + hot_mean, [-1])
@@ -281,6 +365,23 @@ class PhysicsInformedLSTM:
         X_scaled = X_scaled.reshape(X.shape)
         # Use direct forward pass instead of model.predict to avoid tf.function retracing noise
         y_pred_scaled = self.model(X_scaled, training=False).numpy()
+        if self.residual_learning:
+            # model outputs scaled residual for hot outlet
+            hot_residual = (y_pred_scaled[:, 0] * self.scaler_residual.scale_[0]) + self.scaler_residual.mean_[0]
+            # compute baseline from last-step inputs
+            hot_inlet = X[:, -1, 0]
+            hot_flow = X[:, -1, 6]
+            heat_load = X[:, -1, 3]
+            denom = (hot_flow * float(self.cp_hot)) + 1e-12
+            baseline_hot = hot_inlet - (heat_load / denom)
+            hot_pred = baseline_hot + hot_residual
+            # derive cold outlet
+            cold_inlet = X[:, -1, 1]
+            cold_flow = X[:, -1, 2]
+            q_hot = hot_flow * float(self.cp_hot) * (hot_inlet - hot_pred)
+            cold_pred = q_hot / (cold_flow * float(self.cp_cold) + 1e-12) + cold_inlet
+            return np.stack([hot_pred, cold_pred], axis=1)
+
         if self.use_hard_energy_balance or y_pred_scaled.shape[1] == 1:
             # Hard-balance mode predicts hot outlet only; callers derive cold outlet separately.
             hot_scale = float(self.scaler_y.scale_[0])

@@ -61,7 +61,7 @@ from version_2.study_utils import (
 RANDOM_STATE = 42
 DEFAULT_SUBSET_SIZES = [100, 125]
 PILSTM_SEQUENCE_LENGTH = 10
-PILSTM_LSTM_UNITS = 64
+PILSTM_LSTM_UNITS = 128
 PILSTM_LEARNING_RATE = 0.001
 PILSTM_EPOCHS = 1000
 PILSTM_BATCH_SIZE = 32
@@ -393,16 +393,26 @@ def evaluate_pilstm(
     weights_path = results_dir / f"{subset_name}_pilstm.weights.h5"
     pilstm.model.save_weights(weights_path)
 
+    # Use the appropriate scaler based on learning mode
+    if pilstm.residual_learning:
+        scaler_y_mean = pilstm.scaler_residual.mean_
+        scaler_y_scale = pilstm.scaler_residual.scale_
+    else:
+        scaler_y_mean = pilstm.scaler_y.mean_
+        scaler_y_scale = pilstm.scaler_y.scale_
+
     artifact = {
         "subset_name": subset_name,
         "subset_size": subset_size,
         "sequence_length": pilstm.sequence_length,
         "lstm_units": pilstm.lstm_units,
         "learning_rate": pilstm.learning_rate,
+        "residual_learning": pilstm.residual_learning,
+        "use_bidirectional": pilstm.use_bidirectional,
         "scaler_X_mean": pilstm.scaler_X.mean_,
         "scaler_X_scale": pilstm.scaler_X.scale_,
-        "scaler_y_mean": pilstm.scaler_y.mean_,
-        "scaler_y_scale": pilstm.scaler_y.scale_,
+        "scaler_y_mean": scaler_y_mean,
+        "scaler_y_scale": scaler_y_scale,
         "hot_calibration_slope": float(calibration_slope),
         "hot_calibration_intercept": float(calibration_intercept),
         "input_features": [

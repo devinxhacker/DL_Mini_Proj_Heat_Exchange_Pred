@@ -27,12 +27,12 @@ wheels/
 .ipynb_checkpoints
 
 # Model files (large binary files - don't push to GitHub)
-*.h5
-*.keras
-*.joblib
-*.pb
-*.ckpt
-*.weights.h5
+# *.h5
+# *.keras
+# *.joblib
+# *.pb
+# *.ckpt
+# *.weights.h5
 
 # Generated plots and outputs (don't push to GitHub)
 training_history.png
